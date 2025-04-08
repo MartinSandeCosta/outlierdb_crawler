@@ -57,7 +57,7 @@ class OutlierDBScraper:
         # Specify the Chrome version to use
         self.driver = uc.Chrome(
             options=options,
-            version_main=133  # Specify your Chrome version here
+            version_main=135  # Updated to match installed Chrome version
         )
         print("✓ WebDriver setup complete")
 
@@ -71,77 +71,178 @@ class OutlierDBScraper:
             return match.group(1)
         return None
 
-    def wait_for_iframes(self):
-        """Wait for iframes to load in the sequence cards."""
-        print("Waiting for iframes to load...")
+    def extract_video_info_from_card(self, card):
+        """Extract video information from a sequence card."""
         try:
-            # Wait for iframes to be present
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "iframe"))
-            )
-            print("✓ Iframes found")
-            
-            # Wait a bit more for them to fully load
-            time.sleep(2)
-            
-            # Count iframes
-            iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
-            print(f"Found {len(iframes)} iframes")
-            
-            return len(iframes) > 0
+            # Initialize video info dictionary
+            video_info = {
+                'video_url': None,
+                'video_id': None,
+                'likes': 0,
+                'comments': 0,
+                'shares': 0,
+                'saves': 0,
+                'tags': [],
+                'description': ''
+            }
+
+            # First try to get from iframe if it exists
+            iframe = card.find('iframe')
+            if iframe and 'youtube' in iframe.get('src', ''):
+                video_info['video_url'] = iframe.get('src', '')
+                video_info['video_id'] = self.extract_youtube_id(video_info['video_url'])
+
+            # If no iframe, try to get from thumbnail img src
+            if not video_info['video_id']:
+                img = card.find('img', {'alt': 'YouTube Thumbnail'})
+                if img:
+                    src = img.get('src', '')
+                    match = re.search(r'youtube\.com/vi/([^/]+)/', src)
+                    if match:
+                        video_id = match.group(1)
+                        video_info['video_id'] = video_id
+                        video_info['video_url'] = f"https://www.youtube-nocookie.com/embed/{video_id}"
+
+            # Extract metadata (likes, comments, shares, saves)
+            spans = card.find_all('span', class_='ml-1')
+            for span in spans:
+                try:
+                    value = int(span.text.strip())
+                    prev = span.find_previous_sibling()
+                    if prev:
+                        if 'M458.4 64.3' in str(prev):  # Heart/likes icon
+                            video_info['likes'] = value
+                        elif 'M256 32C114.6' in str(prev):  # Comment icon
+                            video_info['comments'] = value
+                        elif 'M237.66,106.35' in str(prev):  # Share icon
+                            video_info['shares'] = value
+                        elif 'M18 2H6c-1.103' in str(prev):  # Save icon
+                            video_info['saves'] = value
+                except ValueError:
+                    continue
+
+            # Extract tags
+            tags = card.find_all('span', class_=lambda x: x and 'py-2 px-3' in x)
+            video_info['tags'] = [tag.text.strip() for tag in tags if tag.text.strip().startswith('#')]
+
+            # Extract description
+            desc = card.find('p', class_='text-neutral-900')
+            if desc:
+                video_info['description'] = desc.text.strip()
+
+            return video_info if video_info['video_id'] else None
+
         except Exception as e:
-            print(f"Error waiting for iframes: {e}")
-            return False
+            logger.error(f"Error extracting video info: {e}")
+            return None
+
+    def handle_subscription_popup(self):
+        """Check for and close the subscription popup if it appears."""
+        try:
+            # Look for the close button in the popup
+            close_button = self.driver.find_element(By.CSS_SELECTOR, "button[class*='bg-red-300']")
+            if close_button and close_button.is_displayed():
+                print("Found subscription popup, closing it...")
+                close_button.click()
+                time.sleep(1)  # Wait for popup to close
+                return True
+        except Exception as e:
+            # Popup not found or not visible, which is fine
+            pass
+        return False
+
+    def wait_for_videos_to_load(self, timeout=10):
+        """Wait for video iframes to load and replace thumbnails."""
+        print("Waiting for videos to load...")
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Get all sequence cards
+            cards = self.driver.find_elements(By.CLASS_NAME, "sequence-card")
+            if not cards:
+                time.sleep(1)
+                continue
+                
+            # Count iframes vs thumbnails
+            iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+            thumbnails = self.driver.find_elements(By.CSS_SELECTOR, "img[alt='YouTube Thumbnail']")
+            
+            print(f"Found {len(iframes)} iframes and {len(thumbnails)} thumbnails")
+            
+            # If we have more iframes than thumbnails, videos have loaded
+            if len(iframes) > len(thumbnails):
+                print("✓ Videos loaded successfully")
+                return True
+                
+            # Click each thumbnail to trigger video load
+            for thumbnail in thumbnails:
+                try:
+                    if thumbnail.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", thumbnail)
+                except:
+                    pass
+            
+            time.sleep(1)
+        
+        print("Warning: Not all videos loaded completely")
+        return False
 
     def scroll_to_bottom(self):
-        """Scroll to the bottom of the page."""
-        print("\nScrolling to bottom...")
-        last_height = self.driver.execute_script("return document.body.scrollHeight")
+        """Scroll through the virtualized list and ensure all items are loaded."""
+        print("\nScrolling through virtualized list...")
         
-        # Scroll down in smaller increments
-        current_height = 0
-        while current_height < last_height:
-            current_height += 300  # Scroll 300px at a time
-            self.driver.execute_script(f"window.scrollTo(0, {current_height});")
-            time.sleep(0.5)  # Small delay between scrolls
+        # Track scroll state
+        last_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+        window_height = self.driver.execute_script("return window.innerHeight")
+        current_position = 0
+        no_new_items_count = 0
+        processed_indices = set()
         
-        # Final scroll to bottom
-        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1)  # Wait for any lazy-loaded content
+        while no_new_items_count < 3:  # Try 3 times before assuming we're at the bottom
+            # Get current items and their indices
+            items = self.driver.find_elements(By.CLASS_NAME, "sequence-card")
+            current_indices = {item.get_attribute('data-index') for item in items if item.get_attribute('data-index')}
+            
+            # Check if we found any new items
+            new_indices = current_indices - processed_indices
+            if new_indices:
+                print(f"Found {len(new_indices)} new items")
+                processed_indices.update(new_indices)
+                no_new_items_count = 0
+            else:
+                no_new_items_count += 1
+                print(f"No new items found (attempt {no_new_items_count}/3)")
+            
+            # Scroll in smaller increments (25% of window height)
+            current_position += int(window_height * 0.25)
+            print(f"Scrolling to position {current_position}")
+            self.driver.execute_script(f"window.scrollTo(0, {current_position});")
+            
+            # Wait for content to load
+            time.sleep(3)
+            
+            # Update scroll height in case more content was loaded
+            new_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+            if new_height > last_height:
+                print("Page height increased, resetting counter")
+                last_height = new_height
+                no_new_items_count = 0
+            
+            # Wait for videos to load
+            self.wait_for_videos_to_load(timeout=5)
+            
+            # If we've reached the bottom, wait longer and check one more time
+            if current_position >= last_height:
+                print("Reached bottom, waiting for final items...")
+                time.sleep(5)
+                final_height = self.driver.execute_script("return document.documentElement.scrollHeight")
+                if final_height > last_height:
+                    last_height = final_height
+                    no_new_items_count = 0
+                else:
+                    no_new_items_count += 1
         
-        print("✓ Scrolled to bottom")
-        # Save HTML after scrolling
-        self.save_html("after_scroll")
-
-    def find_next_button(self):
-        """Find and return the Next button element."""
-        try:
-            # First scroll to bottom
-            self.scroll_to_bottom()
-            
-            # Save HTML before looking for button
-            self.save_html("before_finding_button")
-            
-            # Look for the Next button using more specific selectors
-            # First find the container div
-            container = WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.flex.justify-center.items-center.mt-4.pb-12"))
-            )
-            
-            # Then find the Next button within that container
-            next_button = container.find_element(By.XPATH, ".//button[text()='Next']")
-            
-            # Get the page info
-            page_info = container.find_element(By.CSS_SELECTOR, "span.dark\\:text-neutral-200").text
-            print(f"Page info: {page_info}")
-            
-            print("✓ Found Next button")
-            return next_button
-        except Exception as e:
-            print(f"No Next button found: {str(e)}")
-            # Save HTML when button not found
-            self.save_html("button_not_found")
-            return None
+        print(f"\nFinished scrolling, found {len(processed_indices)} total items")
+        return True
 
     def get_page(self):
         """Load the page and wait for content to be loaded."""
@@ -155,13 +256,12 @@ class OutlierDBScraper:
                 EC.presence_of_element_located((By.CLASS_NAME, "sequence-card"))
             )
             
-            # Give a little extra time for all content to load
+            # Give extra time for initial load
             time.sleep(2)
             print("✓ Page loaded successfully")
             
-            # Wait for initial iframes to load
-            if not self.wait_for_iframes():
-                print("Warning: No iframes found on initial load")
+            # Wait for videos to load
+            self.wait_for_videos_to_load()
             
             # Save HTML after initial load
             self.save_html("initial_load")
@@ -180,66 +280,79 @@ class OutlierDBScraper:
         try:
             print("\n=== Parsing Item ===")
             
-            # Print the HTML structure for debugging
-            print("Item HTML structure:")
-            print(item_element.prettify()[:500] + "..." if len(str(item_element)) > 500 else item_element.prettify())
-            
-            # Extract video URL from iframe
-            iframe = item_element.find('iframe')
-            if iframe:
-                print(f"Found iframe with attributes: {iframe.attrs}")
-            else:
-                print("No iframe found in this item")
-                # Try to find the video URL in the data attributes
-                video_url = item_element.get('data-video-url', '')
-                if video_url:
-                    print(f"Found video URL in data attributes: {video_url}")
-                else:
-                    print("No video URL found in data attributes")
-                
-            video_url = iframe.get('src', '') if iframe else ''
-            
-            # Extract YouTube video ID
-            video_id = self.extract_youtube_id(video_url)
-            
-            # Skip if we've already scraped this video
-            if video_id in self.scraped_ids:
-                print(f"Skipping duplicate video (ID: {video_id})")
-                return None
-                
-            self.scraped_ids.add(video_id)
-            print(f"Video URL: {video_url}")
-            print(f"Video ID: {video_id}")
-
-            # Extract tags - they are in spans with specific classes
-            tags = []
-            tag_spans = item_element.find_all('span', class_='py-2')
-            print(f"Found {len(tag_spans)} tag spans")
-            for tag_span in tag_spans:
-                tag_text = tag_span.text.strip()
-                if tag_text.startswith('#'):
-                    tags.append(tag_text)
-            print(f"Tags found: {', '.join(tags) if tags else 'No tags found'}")
-
-            # Extract description - it's in a p tag with specific classes
-            description_element = item_element.find('p', class_='text-neutral-900')
-            if description_element:
-                print(f"Found description element with text length: {len(description_element.text)}")
-            else:
-                print("No description element found")
-                
-            description = description_element.text.strip() if description_element else ''
-            print(f"Description: {description[:100]}..." if len(description) > 100 else f"Description: {description}")
-
-            print("=== Item Parsed Successfully ===\n")
-            
-            return {
-                'video_url': video_url,
-                'video_id': video_id,
-                'tags': ','.join(tags),
-                'description': description,
+            # Initialize video info dictionary
+            video_info = {
+                'video_url': None,
+                'video_id': None,
+                'likes': 0,
+                'comments': 0,
+                'shares': 0,
+                'saves': 0,
+                'tags': [],
+                'description': '',
+                'data_index': item_element.get('data-index', ''),
                 'scraped_at': datetime.now().isoformat()
             }
+            
+            # First try to get from iframe if it exists
+            iframe = item_element.find('iframe')
+            if iframe and 'youtube' in iframe.get('src', ''):
+                video_info['video_url'] = iframe.get('src', '')
+                video_info['video_id'] = self.extract_youtube_id(video_info['video_url'])
+            
+            # If no iframe, try to get from thumbnail img src
+            if not video_info['video_id']:
+                img = item_element.find('img', {'alt': 'YouTube Thumbnail'})
+                if img:
+                    src = img.get('src', '')
+                    match = re.search(r'youtube\.com/vi/([^/]+)/', src)
+                    if match:
+                        video_id = match.group(1)
+                        video_info['video_id'] = video_id
+                        video_info['video_url'] = f"https://www.youtube-nocookie.com/embed/{video_id}"
+            
+            # Extract metadata (likes, comments, shares, saves)
+            spans = item_element.find_all('span', class_='ml-1')
+            for span in spans:
+                try:
+                    value = int(span.text.strip())
+                    prev = span.find_previous_sibling()
+                    if prev:
+                        svg_path = prev.find('path')
+                        if svg_path:
+                            path_d = svg_path.get('d', '')
+                            if 'M458.4 64.3' in path_d:  # Heart/likes icon
+                                video_info['likes'] = value
+                            elif 'M256 32C114.6' in path_d:  # Comment icon
+                                video_info['comments'] = value
+                            elif 'M237.66,106.35' in path_d:  # Share icon
+                                video_info['shares'] = value
+                            elif 'M18 2H6c-1.103' in path_d:  # Save icon
+                                video_info['saves'] = value
+                except ValueError:
+                    continue
+            
+            # Extract tags
+            tags = item_element.find_all('span', class_=lambda x: x and 'py-2 px-3' in x)
+            video_info['tags'] = [tag.text.strip() for tag in tags if tag.text.strip().startswith('#')]
+            
+            # Extract description
+            desc = item_element.find('p', class_='text-neutral-900')
+            if desc:
+                video_info['description'] = desc.text.strip()
+            
+            # Log the extracted information
+            print(f"Video URL: {video_info['video_url']}")
+            print(f"Video ID: {video_info['video_id']}")
+            print(f"Likes: {video_info['likes']}")
+            print(f"Comments: {video_info['comments']}")
+            print(f"Shares: {video_info['shares']}")
+            print(f"Saves: {video_info['saves']}")
+            print(f"Tags found: {', '.join(video_info['tags'])}")
+            print(f"Description: {video_info['description'][:100]}..." if len(video_info['description']) > 100 else f"Description: {video_info['description']}")
+            
+            return video_info if video_info['video_id'] else None
+            
         except Exception as e:
             logger.error(f"Error parsing item: {e}")
             return None
@@ -247,58 +360,138 @@ class OutlierDBScraper:
     def scrape_items(self):
         """Main scraping function to get all items."""
         items = []
-        page_num = 1
+        processed_indices = set()  # Keep track of which items we've processed
         
         print("\nStarting scraping process...")
         print(f"Base URL: {self.base_url}")
         
-        while True:
-            print(f"\n=== Processing Page {page_num} ===")
-            
-            # Get the page with JavaScript content loaded
-            html = self.get_page()
-            if not html:
-                break
-
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Find all item elements - they are in divs with class 'sequence-card'
-            item_elements = soup.find_all('div', class_='sequence-card')
-            print(f"\nFound {len(item_elements)} items to scrape on page {page_num}")
-            
-            # Print the HTML structure of the first item for debugging
-            if item_elements:
-                print("\nFirst item HTML structure:")
-                print(item_elements[0].prettify()[:500] + "..." if len(str(item_elements[0])) > 500 else item_elements[0].prettify())
-            
-            for index, item_element in enumerate(item_elements, 1):
-                print(f"\nProcessing item {index}/{len(item_elements)} on page {page_num}")
-                
-                item_data = self.parse_item(item_element)
-                if item_data:
-                    items.append(item_data)
-                    print(f"✓ Item {index} added to results")
-                else:
-                    print(f"✗ Failed to parse item {index}")
-                
-                # Be nice to the server
-                print("Waiting 1 second before next item...")
-                time.sleep(1)
-            
-            # Look for the Next button
-            next_button = self.find_next_button()
-            if not next_button:
-                print("\nNo Next button found - we've reached the end")
-                break
-                
-            # Click the Next button
-            print("\nClicking Next button...")
-            next_button.click()
-            page_num += 1
-            
-            # Wait for the new page to load
-            time.sleep(2)
+        # Initial page load
+        html = self.get_page()
+        if not html:
+            return items
         
+        page = 1
+        no_new_items_count = 0
+        max_retries = 10  # Maximum number of attempts to find new items
+        highest_index_seen = -1
+        
+        while no_new_items_count < max_retries:
+            print(f"\nScrolling page {page}")
+            
+            # Get current visible items
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            visible_items = soup.find_all('div', {'data-index': True, 'class': lambda x: x and 'sequence-card' in x})
+            
+            # Sort items by data-index to process in order
+            visible_items.sort(key=lambda x: int(x.get('data-index', '0')))
+            
+            print(f"Found {len(visible_items)} visible items")
+            
+            # Process visible items
+            found_new = False
+            for item in visible_items:
+                try:
+                    index = int(item.get('data-index', '-1'))
+                    if index > highest_index_seen:
+                        highest_index_seen = index
+                    
+                    if index not in processed_indices:
+                        print(f"\nProcessing new item {index}")
+                        item_data = self.parse_item(item)
+                        if item_data:
+                            items.append(item_data)
+                            processed_indices.add(index)
+                            print(f"✓ Item {index} added to results (Total: {len(items)})")
+                            found_new = True
+                        else:
+                            print(f"✗ Failed to parse item {index}")
+                except ValueError:
+                    continue
+            
+            if found_new:
+                no_new_items_count = 0
+            else:
+                no_new_items_count += 1
+                print(f"No new items found (attempt {no_new_items_count}/{max_retries})")
+            
+            # Get the virtualized list container
+            try:
+                # Try different selectors to find the container
+                container_selectors = [
+                    "div[style*='position: relative'][style*='overflow: auto']",
+                    "div[style*='will-change: transform']",
+                    "div.overflow-auto"
+                ]
+                
+                container = None
+                for selector in container_selectors:
+                    try:
+                        container = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if container:
+                            break
+                    except:
+                        continue
+                
+                if container:
+                    # Get the total height from the inner div
+                    total_height = self.driver.execute_script("""
+                        const container = arguments[0];
+                        const innerDiv = container.firstElementChild;
+                        return innerDiv ? parseInt(innerDiv.style.height) : 0;
+                    """, container)
+                    
+                    print(f"Container total height: {total_height}px")
+                    
+                    # Calculate current scroll and scroll to next section
+                    current_scroll = self.driver.execute_script("return arguments[0].scrollTop;", container)
+                    
+                    # Calculate scroll amount based on container height
+                    scroll_amount = 800  # Scroll by a larger amount to ensure new content loads
+                    new_scroll = current_scroll + scroll_amount
+                    
+                    print(f"Current container scroll: {current_scroll}px")
+                    print(f"Scrolling to: {new_scroll}px")
+                    
+                    # Scroll the container
+                    self.driver.execute_script("""
+                        const container = arguments[0];
+                        const targetScroll = arguments[1];
+                        container.scrollTo({
+                            top: targetScroll,
+                            behavior: 'smooth'
+                        });
+                    """, container, new_scroll)
+                    
+                    # Wait for content to load
+                    time.sleep(3)
+                    
+                    # Check if we actually scrolled
+                    new_actual_scroll = self.driver.execute_script("return arguments[0].scrollTop;", container)
+                    print(f"New container scroll position: {new_actual_scroll}px")
+                    
+                    if new_actual_scroll <= current_scroll and not found_new:
+                        print("Could not scroll further in container")
+                        no_new_items_count += 1
+                else:
+                    print("Could not find virtualized list container")
+                    no_new_items_count += 1
+                    
+            except Exception as e:
+                print(f"Error scrolling container: {e}")
+                no_new_items_count += 1
+            
+            # Handle subscription popup if it appears
+            self.handle_subscription_popup()
+            
+            # Wait for videos to load
+            self.wait_for_videos_to_load(timeout=5)
+            
+            # Save debug HTML periodically
+            if len(items) % 10 == 0 and len(items) > 0:
+                self.save_html(f"items_{len(items)}")
+        
+        print(f"\nFinished scraping {len(items)} items")
+        print(f"Highest index seen: {highest_index_seen}")
         return items
 
     def save_to_csv(self, items, filename='outlierdb_items.csv'):
